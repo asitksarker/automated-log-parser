@@ -1,79 +1,87 @@
-import re
+import win32evtlog
 import csv
 from datetime import datetime, timedelta
 from collections import defaultdict
 
 # --- CONFIGURATION ---
-LOG_FILE = "access.log"
-BLOCKLIST_FILE = "blocklist.csv"
-FAILED_THRESHOLD = 5  # Max failed attempts before blocking
-TRAVEL_WINDOW_HOURS = 1  # Timeframe for Impossible Travel
+LOG_TYPE = "Security"
+BLOCKLIST_FILE = "windows_blocklist.csv"
+FAILED_THRESHOLD = 5
+TRAVEL_WINDOW_HOURS = 1
 
-# Regex for Nginx Log: IP - - [Date] "Request" Status ...
-LOG_PATTERN = r'(?P<ip>\d+\.\d+\.\d+\.\d+).*?\[(?P<timestamp>.*?)\] ".*?" (?P<status>\d+)'
-
-# Mock GeoIP Database (In production, use an API or MaxMind)
 def get_location(ip):
-    # This is a placeholder. Real implementation would use:
-    # requests.get(f"http://ip-api.com/json/{ip}").json()
-    mock_db = {
-        "1.1.1.1": "US",
-        "2.2.2.2": "UK",
-        "3.3.3.3": "CN"
-    }
+    # Placeholder: In a real SOC environment, use MaxMind or ip-api.com
+    mock_db = {"10.0.0.1": "US", "192.168.1.50": "FR"}
     return mock_db.get(ip, "Unknown")
 
-def parse_logs():
-    failed_attempts = defaultdict(int)  # IP: count
-    user_logins = {}  # User/IP: {'time': datetime, 'country': str}
-    suspicious_ips = set()
+def parse_windows_logs():
+    server = 'localhost'
+    handle = win32evtlog.OpenEventLog(server, LOG_TYPE)
+    flags = win32evtlog.EVENTLOG_BACKWARDS_READ | win32evtlog.EVENTLOG_SEQUENTIAL_READ
+    
+    failed_attempts = defaultdict(int)
+    user_logins = {} # Username: {'time': ts, 'country': country}
+    threats = set()
 
-    with open(LOG_FILE, "r") as f:
-        for line in f:
-            match = re.search(LOG_PATTERN, line)
-            if not match:
-                continue
+    print(f"[*] Scanning {LOG_TYPE} logs...")
 
-            ip = match.group('ip')
-            status = match.group('status')
-            # Example timestamp: 30/Apr/2026:14:00:01 +0000
-            ts_str = match.group('timestamp').split(' ')[0]
-            ts = datetime.strptime(ts_str, "%d/%b/%Y:%H:%M:%S")
+    while True:
+        events = win32evtlog.ReadEventLog(handle, flags, 0)
+        if not events:
+            break
 
-            # 1. Logic: Detect Brute Force (Repeated 401/403 errors)
-            if status in ["401", "403"]:
-                failed_attempts[ip] += 1
-                if failed_attempts[ip] >= FAILED_THRESHOLD:
-                    suspicious_ips.add((ip, "Brute Force Attempt"))
+        for event in events:
+            # Event ID 4625 = Failed Login
+            if event.EventID == 4625:
+                # String index 18 is typically the Source Network Address in 4625 events
+                try:
+                    ip = event.StringInserts[19] 
+                    if ip and ip != "-":
+                        failed_attempts[ip] += 1
+                        if failed_attempts[ip] >= FAILED_THRESHOLD:
+                            threats.add((ip, "Brute Force (Event 4625)"))
+                except IndexError:
+                    continue
 
-            # 2. Logic: Impossible Travel
-            if status == "200":  # Successful login
-                current_country = get_location(ip)
-                
-                if ip in user_logins:
-                    last_login = user_logins[ip]
-                    time_diff = ts - last_login['time']
+            # Event ID 4624 = Successful Login
+            elif event.EventID == 4624:
+                try:
+                    username = event.StringInserts[5]
+                    ip = event.StringInserts[18]
+                    ts = event.TimeGenerated
                     
-                    if current_country != last_login['country'] and time_diff < timedelta(hours=TRAVEL_WINDOW_HOURS):
-                        suspicious_ips.add((ip, f"Impossible Travel: {last_login['country']} -> {current_country}"))
-                
-                # Update last known login for this entity
-                user_logins[ip] = {'time': ts, 'country': current_country}
+                    if ip and ip != "-" and "127.0.0.1" not in ip:
+                        country = get_location(ip)
+                        
+                        if username in user_logins:
+                            last = user_logins[username]
+                            time_diff = ts - last['time']
+                            
+                            if country != last['country'] and time_diff < timedelta(hours=TRAVEL_WINDOW_HOURS):
+                                threats.add((ip, f"Impossible Travel: {username} from {last['country']} to {country}"))
+                        
+                        user_logins[username] = {'time': ts, 'country': country}
+                except IndexError:
+                    continue
 
-    return suspicious_ips
+    return threats
 
-def export_blocklist(threats):
+def export_threats(threats):
+    if not threats:
+        print("[-] No suspicious activity found.")
+        return
+
     with open(BLOCKLIST_FILE, "w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["IP Address", "Reason", "Detected At"])
+        writer.writerow(["Source IP", "Reason", "Timestamp"])
         for ip, reason in threats:
-            writer.writerow([ip, reason, datetime.now().strftime("%Y-%m-%d %H:%M:%S")])
-    print(f"[+] Successfully exported {len(threats)} IPs to {BLOCKLIST_FILE}")
+            writer.writerow([ip, reason, datetime.now()])
+    print(f"[+] Exported {len(threats)} threats to {BLOCKLIST_FILE}")
 
 if __name__ == "__main__":
-    print("[*] Starting Log Analysis...")
-    detected_threats = parse_logs()
-    if detected_threats:
-        export_blocklist(detected_threats)
-    else:
-        print("[-] No suspicious activity detected.")
+    # Note: Must run as Administrator to access Security Logs
+    try:
+        detected = parse_windows_logs()
+        export_threats(detected)
+    except Exception as e:
+        print(f"[!] Error: {e}. Did you run as Administrator?")
